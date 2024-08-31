@@ -2,6 +2,12 @@ Reproduce the PPoPP'23 Paper [Stream-K: Work-centric Parallel Decomposition for 
 
 ![example](./figures/image.png)
 
+Dependencies:
+
+```bash
+pip install git+https://github.com/microsoft/BitBLAS.git
+```
+
 TODO Items:
 - [ ] Implement Float16 Tensor Core
 - [ ] Implement Dequantize template and integrate with BitBLAS
