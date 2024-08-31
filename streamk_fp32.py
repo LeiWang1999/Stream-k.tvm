@@ -1,10 +1,11 @@
 import torch
 import torch.backends
-import triton
-import triton.language as tl
-import random
 from bitblas import tvm as tvm
 from tvm import tl as TL
+import math
+
+def cdiv(a, b):
+    return math.ceil(a / b)
 # disable tf32
 torch.backends.cuda.matmul.allow_tf32 = False
 header = """
@@ -14,7 +15,6 @@ __device__ void acquire_lock(int* lock) {
     }
 }
 """
-
 
 m, n, k = 16, 16384, 8192  # some problem size to test
 
@@ -32,9 +32,9 @@ two_tiles = False
 M, K = A.shape
 _, N = B.shape
 # compute grid (work to do per SM on the first wave)
-total_blocks_M = triton.cdiv(M, BLK_M)
-total_blocks_N = triton.cdiv(N, BLK_N)
-iters_per_tile = triton.cdiv(K, BLK_K)
+total_blocks_M = cdiv(M, BLK_M)
+total_blocks_N = cdiv(N, BLK_N)
+iters_per_tile = cdiv(K, BLK_K)
 total_tiles = total_blocks_M * total_blocks_N
 total_programs_streamk = total_sm
 if total_programs_streamk > 0:  # Stream-K
