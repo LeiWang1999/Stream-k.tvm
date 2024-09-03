@@ -7,12 +7,11 @@ from bitblas.base.arch import CUDA
 from bitblas.utils import auto_detect_nvidia_target
 from bitblas.gpu.matmul_analysis import (
     get_swizzle_layout,
-    mma_store_32x8_to_shared_16x16_layout,
+    mma_store_index_map,
+    get_ldmatrix_offset,
 )
 
-index_map_rev = mma_store_32x8_to_shared_16x16_layout
-
-
+# Support we're from a config file
 arch = CUDA(auto_detect_nvidia_target())
 intrin_info = bitblas.base.hint.IntrinInfo(
     in_dtype="float16",
@@ -28,7 +27,7 @@ config = bitblas.base.Hint.from_dict(
         "pipeline_stage": 1,
         "use_async": False,
         "intrin_info": intrin_info,
-        "shared_scope": "shared",
+        "shared_scope": "shared.dyn",
         "vectorize": {"b": 8, "a": 8},
     }
 )
@@ -92,7 +91,7 @@ def tl_matmul(
     local_size = (micro_size_x * micro_size_y) // warp_size
     warp_rows = warp_row_tiles // micro_size_x
     warp_cols = warp_col_tiles // micro_size_y
-    
+
     @T.prim_func
     def main(
         A: T.Buffer(A_shape, dtypeAB),
@@ -124,7 +123,7 @@ def tl_matmul(
             for i in T.serial(warp_rows * warp_cols * local_size):
                 C_local[i] = 0
 
-            for ko in T.Pipelined((K // block_K), num_stages=0):
+            for ko in T.Pipelined((K // block_K), num_stages=(stage - 1)):
                 # TODO(lei): storage sync should be able to be injected automatically by TVM Pass
                 T.tvm_storage_sync("shared")
 
@@ -143,33 +142,31 @@ def tl_matmul(
                     # Load A into fragment
                     for i in T.serial(warp_rows):
                         T.ptx_ldmatrix("float16", T.bool(False), 4, ".b16", A_local.data, i * local_size, 
-                            T.address_of(A_shared[ty * warp_row_tiles + i * micro_size_x, ki * micro_size_k]),
-                            # TODO(lei): this should be lifed to become a general indexmap
-                            block_K * (tx % 16) + 8 * (tx // 16))
+                            T.address_of(A_shared[ty * warp_row_tiles + i * micro_size_x, ki * micro_size_k]), get_ldmatrix_offset("A", tx, 0, block_K, "float16", False))
 
                     # Load B into fragment
                     for j in T.serial(warp_cols):
                         T.ptx_ldmatrix("float16", T.bool(False), 4, ".b16", B_local.data, j * local_size,
-                            T.address_of(B_shared[tz * warp_col_tiles + j * micro_size_y, ki * micro_size_k]),
-                            # TODO(lei): this should be lifed to become a general indexmap
-                            block_K * 8 * (tx // 16) + block_K * (tx % 8) + 8 * (tx % 16 // 8))
+                            T.address_of(B_shared[tz * warp_col_tiles + j * micro_size_y, ki * micro_size_k]), get_ldmatrix_offset("B", tx, 0, block_K, "float16", True))
 
                     # Apply MMA
                     for i, j in T.grid(warp_rows, warp_cols,):
                         T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size, C_local.data, i * warp_cols * local_size + j * local_size, T.bool(False),)
                         T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size + 4, C_local.data, i * warp_cols * local_size + j * local_size + 4, T.bool(False))
 
-                # STS
-                # MMA Store must be in simulated instead of TVM Intrins
-                # As TVM Intrins is like a hack that the threadIdx.x should be always
-                # equal to the warp_size
-                for i, j in T.grid(warp_rows, warp_cols):
-                    for local_id in T.serial(local_size):
-                        row, col = T.meta_var(index_map_rev(tx, local_id))
-                        C_shared[ty * warp_rows + i, tz * warp_cols + j, row, col] = C_local[i * (warp_cols * local_size) + j * local_size + local_id]
+            # STS
+            # MMA Store must be in simulated instead of TVM Intrins
+            # As TVM Intrins is like a hack that the threadIdx.x should be always
+            # equal to the warp_size
+            for i, j in T.grid(warp_rows, warp_cols):
+                for local_id in T.serial(local_size):
+                    row, col = T.meta_var(
+                        mma_store_index_map(tx, local_id)
+                    )
+                    C_shared[ty * warp_rows + i, tz * warp_cols + j, row, col] = C_local[i * (warp_cols * local_size) + j * local_size + local_id]
 
-                for i, j in T.Parallel(block_M, block_N):
-                    C[by * block_M + i, bx * block_N + j] = C_shared[i // micro_size_x, j // micro_size_y, i % micro_size_x, j % micro_size_y]
+            for i, j in T.Parallel(block_M, block_N):
+                C[by * block_M + i, bx * block_N + j] = C_shared[i // micro_size_x, j // micro_size_y, i % micro_size_x, j % micro_size_y]
 
     return main
 
@@ -187,8 +184,11 @@ def tvm_callback_cuda_postproc(code, _):
 mod, params = TL.lower(matmul)
 print(mod.imported_modules[0].get_source())
 mod = TL.Profiler(mod, params, [], TL.TensorSupplyType.Integer)
+
 mod(A, B, C)
 
+latency = mod.do_bench(mod.func, warmup = 25)
+print(f"Latency: {latency}")
 print(C)
 
 ref_c = torch.matmul(A, B.T).float()
