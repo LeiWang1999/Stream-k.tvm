@@ -158,8 +158,7 @@ def tl_matmul(
             ):
                 C_local[i] = 0
 
-            # for ko in T.Pipelined((K // block_K), num_stages=0):
-            for ko in T.serial(0, (K // block_K)):
+            for ko in T.Pipelined((K // block_K), num_stages=0):
                 # TODO(lei): storage sync should be able to be injected automatically by TVM Pass
                 T.tvm_storage_sync("shared")
 
