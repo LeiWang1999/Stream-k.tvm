@@ -3,16 +3,14 @@ import torch.backends
 import bitblas
 from bitblas import tvm as tvm
 from tvm import tl as TL
-
 from bitblas.base.arch import CUDA
 from bitblas.utils import auto_detect_nvidia_target
+from bitblas.gpu.matmul_analysis import (
+    get_swizzle_layout,
+    mma_store_32x8_to_shared_16x16_layout,
+)
 
-def mma_32x8_to_shared_16x16_layout(thread_id, local_id):
-    row = 8 * (local_id % 4 // 2) + (thread_id // 4)
-    col = 8 * (local_id // 4) + (thread_id % 4) * 2 + (local_id % 2)
-    return row, col
-
-index_map_rev = mma_32x8_to_shared_16x16_layout
+index_map_rev = mma_store_32x8_to_shared_16x16_layout
 
 
 arch = CUDA(auto_detect_nvidia_target())
@@ -55,6 +53,25 @@ A = torch.rand(M, K, device="cuda", dtype=torch.float16)
 B = torch.rand(N, K, device="cuda", dtype=torch.float16)
 C = torch.zeros(M, N, device="cuda", dtype=torch.float32)
 
+
+import tvm.tl.language as T
+
+
+def make_swizzle_layout(shared_buf):
+    dtype = shared_buf.dtype
+    shape = shared_buf.shape
+    print(f"shape: {shape}")
+
+    def transform_func(i, j):
+        # transform to 16x32
+        new_warp_i, new_warp_j = get_swizzle_layout(i, j, shape[-1], dtype)
+        print(f"i: {i}, j: {j}, new_i: {new_warp_i}, new_j: {new_warp_j}")
+        return [new_warp_i, new_warp_j]
+
+    # atomicAdd can not be vectorized, so we need to reorder dq to match the 8x8 gemm fragment
+    return T.Layout(shape, transform_func)
+
+
 def tl_matmul(
     M,
     N,
@@ -74,35 +91,51 @@ def tl_matmul(
     B_shared_shape = (block_N, block_K)
     C_shared_shape = (block_M // micro_size_x, block_N // micro_size_y, micro_size_x, micro_size_y)
 
-    import tvm.tl.language as T
     warp_size = 32
     threads = warp_size * (block_row_warps * block_col_warps)
     local_size = (micro_size_x * micro_size_y) // warp_size
-
+    warp_rows = warp_row_tiles // micro_size_x
+    warp_cols = warp_col_tiles // micro_size_y
+    
     @T.prim_func
-    def main(A: T.Buffer(A_shape, dtypeAB), B: T.Buffer(B_shape, dtypeAB), C: T.Buffer((M, N), dtypeC)):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+    def main(
+        A: T.Buffer(A_shape, dtypeAB),
+        B: T.Buffer(B_shape, dtypeAB),
+        C: T.Buffer((M, N), dtypeC),
+    ):
+        with T.Kernel(
+            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
+        ) as (bx, by):
 
             A_shared = T.alloc_shared(A_shared_shape, dtypeAB, scope=shared_scope)
             B_shared = T.alloc_shared(B_shared_shape, dtypeAB, scope=shared_scope)
             C_shared = T.alloc_shared(C_shared_shape, dtypeC, scope=shared_scope)
-            A_local = T.alloc_fragment(((warp_row_tiles // micro_size_x) * local_size), dtypeAB, scope="local")
-            B_local = T.alloc_fragment(((warp_col_tiles // micro_size_y) * local_size), dtypeAB, scope="local")
-            C_local = T.alloc_fragment(((warp_row_tiles // micro_size_x) * (warp_col_tiles // micro_size_y) * local_size), accum_dtype, scope="local")
+            A_local = T.alloc_fragment((warp_rows * local_size), dtypeAB, scope="local")
+            B_local = T.alloc_fragment((warp_cols * local_size), dtypeAB, scope="local")
+            C_local = T.alloc_fragment((warp_rows * warp_cols * local_size), accum_dtype, scope="local")
             thread_bindings = T.thread_binding(0, threads, "threadIdx.x")
             tx = thread_bindings % warp_size
             ty = (thread_bindings // warp_size) % block_row_warps
-            tz = (thread_bindings // (warp_size * block_row_warps))
+            tz = thread_bindings // (warp_size * block_row_warps)
 
-            for i in T.serial(((warp_row_tiles // micro_size_x) * (warp_col_tiles // micro_size_y) * local_size)):
+            T.annotate_layout(
+                {
+                    A_shared: make_swizzle_layout(A_shared),
+                    B_shared: make_swizzle_layout(B_shared),
+                }
+            )
+
+            for i in T.serial(warp_rows * warp_cols * local_size):
                 C_local[i] = 0
 
-            for ko in T.Pipelined((K // block_K), num_stages=2):
+            for ko in T.Pipelined((K // block_K), num_stages=0):
                 # TODO(lei): storage sync should be able to be injected automatically by TVM Pass
                 T.tvm_storage_sync("shared")
+
                 # Load A into shared memory
                 for i, k in T.Parallel(block_M, block_K):
                     A_shared[i, k] = A[by * block_M + i, ko * block_K + k]
+
                 # Load B into shared memory
                 for j, k in T.Parallel(block_N, block_K):
                     B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
@@ -112,26 +145,32 @@ def tl_matmul(
 
                 for ki in T.serial(0, (block_K // micro_size_k)):
                     # Load A into fragment
-                    for i in T.serial(warp_row_tiles // micro_size_x):
-                        T.ptx_ldmatrix("float16", T.bool(False), 4, ".b16", A_local.data, i * local_size, T.address_of(A_shared[ty * warp_row_tiles + i * micro_size_x, ki * micro_size_k]), block_K * (tx % 16) + 8 * (tx // 16))
+                    for i in T.serial(warp_rows):
+                        T.ptx_ldmatrix("float16", T.bool(False), 4, ".b16", A_local.data, i * local_size, 
+                            T.address_of(A_shared[ty * warp_row_tiles + i * micro_size_x, ki * micro_size_k]),
+                            # TODO(lei): this should be lifed to become a general indexmap
+                            block_K * (tx % 16) + 8 * (tx // 16))
 
                     # Load B into fragment
-                    for j in T.serial(warp_col_tiles // micro_size_y):
-                        T.ptx_ldmatrix("float16", T.bool(False), 4, ".b16", B_local.data, j * local_size, T.address_of(B_shared[tz * warp_col_tiles + j * micro_size_y, ki * micro_size_k]), block_K * 8 * (tx // 16) + block_K * (tx % 8) + 8 * (tx % 16 // 8))
+                    for j in T.serial(warp_cols):
+                        T.ptx_ldmatrix("float16", T.bool(False), 4, ".b16", B_local.data, j * local_size,
+                            T.address_of(B_shared[tz * warp_col_tiles + j * micro_size_y, ki * micro_size_k]),
+                            # TODO(lei): this should be lifed to become a general indexmap
+                            block_K * 8 * (tx // 16) + block_K * (tx % 8) + 8 * (tx % 16 // 8))
 
                     # Apply MMA
-                    for i, j in T.grid((warp_row_tiles // micro_size_x), (warp_col_tiles // micro_size_y)):
-                        T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size, C_local.data, i * (warp_col_tiles // micro_size_y) * local_size + j * local_size, T.bool(False))
-                        T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size + 4, C_local.data, i * (warp_col_tiles // micro_size_y) * local_size + j * local_size + 4, T.bool(False))
+                    for i, j in T.grid(warp_rows, warp_cols,):
+                        T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size, C_local.data, i * warp_cols * local_size + j * local_size, T.bool(False),)
+                        T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size + 4, C_local.data, i * warp_cols * local_size + j * local_size + 4, T.bool(False))
 
                 # STS
                 # MMA Store must be in simulated instead of TVM Intrins
                 # As TVM Intrins is like a hack that the threadIdx.x should be always
                 # equal to the warp_size
-                for i, j in T.grid((warp_row_tiles // micro_size_x), (warp_col_tiles // micro_size_y)):
+                for i, j in T.grid(warp_rows, warp_cols):
                     for local_id in T.serial(local_size):
                         row, col = T.meta_var(index_map_rev(tx, local_id))
-                        C_shared[ty * (warp_row_tiles // micro_size_x) + i, tz * (warp_col_tiles // micro_size_y) + j, row, col] = C_local[i * (warp_col_tiles // micro_size_y * local_size) + j * local_size + local_id]
+                        C_shared[ty * warp_rows + i, tz * warp_cols + j, row, col] = C_local[i * (warp_cols * local_size) + j * local_size + local_id]
 
                 for i, j in T.Parallel(block_M, block_N):
                     C[by * block_M + i, bx * block_N + j] = C_shared[i // micro_size_x, j // micro_size_y, i % micro_size_x, j % micro_size_y]
@@ -139,14 +178,15 @@ def tl_matmul(
     return main
 
 
-matmul = tl_matmul(
-    M, N, K, "float16", "float32", "float32")
+matmul = tl_matmul(M, N, K, "float16", "float32", "float32")
 
 print(matmul)
+
 
 @tvm.register_func(func_name="tvm_callback_cuda_postproc", override=True)
 def tvm_callback_cuda_postproc(code, _):
     return code
+
 
 mod, params = TL.lower(matmul)
 print(mod.imported_modules[0].get_source())
@@ -157,4 +197,4 @@ print(C)
 
 ref_c = torch.matmul(A, B.T).float()
 print(ref_c)
-torch.testing.assert_allclose(C, ref_c, rtol=1e-2, atol=1e-2)
+torch.testing.assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
