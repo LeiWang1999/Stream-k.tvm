@@ -60,12 +60,9 @@ import tvm.tl.language as T
 def make_swizzle_layout(shared_buf):
     dtype = shared_buf.dtype
     shape = shared_buf.shape
-    print(f"shape: {shape}")
 
     def transform_func(i, j):
-        # transform to 16x32
         new_warp_i, new_warp_j = get_swizzle_layout(i, j, shape[-1], dtype)
-        print(f"i: {i}, j: {j}, new_i: {new_warp_i}, new_j: {new_warp_j}")
         return [new_warp_i, new_warp_j]
 
     return T.Layout(shape, transform_func)
