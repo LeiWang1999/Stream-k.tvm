@@ -68,7 +68,6 @@ def make_swizzle_layout(shared_buf):
         print(f"i: {i}, j: {j}, new_i: {new_warp_i}, new_j: {new_warp_j}")
         return [new_warp_i, new_warp_j]
 
-    # atomicAdd can not be vectorized, so we need to reorder dq to match the 8x8 gemm fragment
     return T.Layout(shape, transform_func)
 
 
