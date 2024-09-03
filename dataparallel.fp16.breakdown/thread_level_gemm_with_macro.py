@@ -115,6 +115,13 @@ def tl_matmul(
             C_local = T.alloc_fragment((warp_rows * warp_cols * local_size), accum_dtype, scope="local")
             thread_bindings = T.thread_binding(0, threads, "threadIdx.x")
 
+            T.annotate_layout(
+                {
+                    A_shared: make_swizzle_layout(A_shared),
+                    B_shared: make_swizzle_layout(B_shared),
+                }
+            )
+            
             for i in T.serial(warp_rows * warp_cols * local_size):
                 C_local[i] = 0
 
@@ -142,7 +149,7 @@ def tl_matmul(
                         ki,
                         thread_bindings=thread_bindings,
                     )
-                    
+
                     # Load B into fragment
                     ptx_macro_generator.LDMATRIX_B(
                         ptx_macro_generator,
