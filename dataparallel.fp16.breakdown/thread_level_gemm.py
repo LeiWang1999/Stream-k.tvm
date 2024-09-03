@@ -79,7 +79,6 @@ def tl_matmul(
     threads = warp_size * (block_row_warps * block_col_warps)
     local_size = (micro_size_x * micro_size_y) // warp_size
 
-
     @T.prim_func
     def main(A: T.Buffer(A_shape, dtypeAB), B: T.Buffer(B_shape, dtypeAB), C: T.Buffer((M, N), dtypeC)):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
@@ -98,7 +97,9 @@ def tl_matmul(
             for i in T.serial(((warp_row_tiles // micro_size_x) * (warp_col_tiles // micro_size_y) * local_size)):
                 C_local[i] = 0
 
-            for ko in T.Pipelined((K // block_K), num_stages=3):
+            for ko in T.Pipelined((K // block_K), num_stages=2):
+                # TODO(lei): storage sync should be able to be injected automatically by TVM Pass
+                T.tvm_storage_sync("shared")
                 # Load A into shared memory
                 for i, k in T.Parallel(block_M, block_K):
                     A_shared[i, k] = A[by * block_M + i, ko * block_K + k]
@@ -106,24 +107,22 @@ def tl_matmul(
                 for j, k in T.Parallel(block_N, block_K):
                     B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
 
-                # TODO(lei): should be able to be injected automatically by TVM Pass
+                # TODO(lei): storage sync should be able to be injected automatically by TVM Pass
                 T.tvm_storage_sync("shared")
-                
+
                 for ki in T.serial(0, (block_K // micro_size_k)):
                     # Load A into fragment
                     for i in T.serial(warp_row_tiles // micro_size_x):
                         T.ptx_ldmatrix("float16", T.bool(False), 4, ".b16", A_local.data, i * local_size, T.address_of(A_shared[ty * warp_row_tiles + i * micro_size_x, ki * micro_size_k]), block_K * (tx % 16) + 8 * (tx // 16))
-                    
+
                     # Load B into fragment
                     for j in T.serial(warp_col_tiles // micro_size_y):
                         T.ptx_ldmatrix("float16", T.bool(False), 4, ".b16", B_local.data, j * local_size, T.address_of(B_shared[tz * warp_col_tiles + j * micro_size_y, ki * micro_size_k]), block_K * 8 * (tx // 16) + block_K * (tx % 8) + 8 * (tx % 16 // 8))
-                    
+
                     # Apply MMA
                     for i, j in T.grid((warp_row_tiles // micro_size_x), (warp_col_tiles // micro_size_y)):
                         T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size, C_local.data, i * (warp_col_tiles // micro_size_y) * local_size + j * local_size, T.bool(False))
                         T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size + 4, C_local.data, i * (warp_col_tiles // micro_size_y) * local_size + j * local_size + 4, T.bool(False))
-                    
-                    T.tvm_storage_sync("shared")
 
                 # STS
                 # MMA Store must be in simulated instead of TVM Intrins
