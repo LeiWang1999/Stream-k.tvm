@@ -4,12 +4,17 @@ import bitblas
 from bitblas import tvm as tvm
 from tvm import tl as TL
 from bitblas.base.arch import CUDA
+from bitblas.base.roller.rasterization import Rasterization2DColumn
 from bitblas.utils import auto_detect_nvidia_target
 from bitblas.tl.utils import get_swizzle_layout
 from bitblas.tl.macro_generator import TensorCorePTXMacroGenerator
 
+torch.manual_seed(0)
+
+VERIFY_CORRECTNESS = False
 in_dtype = "float16"
-accum_dtype = "float32"
+accum_dtype = "float16"
+# accum_dtype = "float16"
 # Support we're from a config file
 arch = CUDA(auto_detect_nvidia_target())
 intrin_info = bitblas.base.hint.IntrinInfo(
@@ -21,13 +26,14 @@ config = bitblas.base.Hint.from_dict(
     {
         "arch": arch,
         "block": [128, 256],
-        "warp": [64, 64],
+        "warp": [64, 128],
         "rstep": [32],
         "pipeline_stage": 2,
         "use_async": False,
         "intrin_info": intrin_info,
         "shared_scope": "shared.dyn",
         "vectorize": {"b": 8, "a": 8},
+        "rasterization_plan": Rasterization2DColumn(10),
     }
 )
 
@@ -42,10 +48,17 @@ chunk = config.rstep[0]
 # tensor core intrinsic size
 shared_scope = config.shared_scope
 micro_size_x, micro_size_y, micro_size_k = 16, 16, 16
+# for L2 cache
+swizzle_panel_size = config.rasterization_plan.panel_width
+device_func, invoke_func = config.rasterization_plan.get_code()
 
 M = 16384
 N = 16384
 K = 16384
+if VERIFY_CORRECTNESS:
+    M = 256
+    N = 512
+    K = 128
 
 A = torch.rand(M, K, device="cuda", dtype=getattr(torch, in_dtype))
 B = torch.rand(N, K, device="cuda", dtype=getattr(torch, in_dtype))
@@ -97,6 +110,7 @@ def tl_matmul(
         block_col_warps=block_col_warps, warp_row_tiles=warp_row_tiles,
         warp_col_tiles=warp_col_tiles, chunk=chunk, threads=threads
     )
+
     @T.prim_func
     def main(
         A: T.Buffer(A_shape, dtypeAB),
@@ -121,13 +135,13 @@ def tl_matmul(
                     B_shared: make_swizzle_layout(B_shared),
                 }
             )
-            
+
+            T.use_swizzle(panel_size=10)
+
             for i in T.serial(warp_rows * warp_cols * local_size):
                 C_local[i] = 0
 
             for ko in T.Pipelined((K // block_K), num_stages=(stage - 1)):
-                # TODO(lei): storage sync should be injected automatically by TVM Pass
-                T.tvm_storage_sync("shared")
 
                 # Load A into shared memory
                 for i, k in T.Parallel(block_M, block_K):
@@ -136,9 +150,6 @@ def tl_matmul(
                 # Load B into shared memory
                 for j, k in T.Parallel(block_N, block_K):
                     B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
-
-                # TODO(lei): storage sync should be injected automatically by TVM Pass
-                T.tvm_storage_sync("shared")
 
                 for ki in T.serial(0, (block_K // micro_size_k)):
                     # Load A into fragment
@@ -179,7 +190,7 @@ def tl_matmul(
     return main
 
 
-matmul = tl_matmul(M, N, K, "float16", "float32", "float32")
+matmul = tl_matmul(M, N, K, in_dtype, accum_dtype, accum_dtype)
 
 print(matmul)
 
@@ -197,8 +208,12 @@ mod(A, B, C)
 
 latency = mod.do_bench(mod.func, warmup = 25)
 print(f"Latency: {latency}")
-print(C)
 
-ref_c = torch.matmul(A, B.T).float()
+
+if not VERIFY_CORRECTNESS:
+    exit()
+
+print(C)
+ref_c = torch.matmul(A, B.T).to(getattr(torch, accum_dtype))
 print(ref_c)
 torch.testing.assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
