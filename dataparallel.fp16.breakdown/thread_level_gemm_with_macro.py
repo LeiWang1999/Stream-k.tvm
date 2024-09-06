@@ -138,8 +138,7 @@ def tl_matmul(
 
             T.use_swizzle(panel_size=10)
 
-            for i in T.serial(warp_rows * warp_cols * local_size):
-                C_local[i] = 0
+            T.clear(C_local)
 
             for ko in T.Pipelined((K // block_K), num_stages=(stage - 1)):
 
@@ -152,6 +151,7 @@ def tl_matmul(
                     B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
 
                 for ki in T.serial(0, (block_K // micro_size_k)):
+
                     # Load A into fragment
                     ptx_macro_generator.LDMATRIX_A(
                         ptx_macro_generator,

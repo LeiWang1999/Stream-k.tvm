@@ -120,8 +120,7 @@ def tl_matmul(
                 }
             )
 
-            for i in T.serial(warp_rows * warp_cols * local_size):
-                C_local[i] = 0
+            T.clear(C_local)
 
             for ko in T.Pipelined((K // block_K), num_stages=(stage - 1)):
                 # TODO(lei): storage sync should be able to be injected automatically by TVM Pass
