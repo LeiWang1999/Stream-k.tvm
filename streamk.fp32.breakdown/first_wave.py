@@ -13,82 +13,98 @@ __device__ void acquire_lock(int* lock) {
 }
 """
 
-# iterate, multiply and accumulate over K axis
-@triton.jit()
-def mac_loop(A, B, C,
-             M, N, K,
-             locks,
-             stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-             iters_per_tile,
-             start_iter, end_iter,
-             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-             ACC_TYPE: tl.constexpr, GROUP_M: tl.constexpr):
+@triton.jit
+def linear_tile(tile_id,
+                # Matrix dimensions
+                M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                # Meta-parameters
+                BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+                GROUP_SIZE_M: tl.constexpr):
+    pid_m = tile_id // tl.cdiv(N, BLOCK_SIZE_N)
+    pid_n = tile_id % tl.cdiv(N, BLOCK_SIZE_N)
+    return pid_m, pid_n
 
-    # where are we in the grid
+# Multiply-accumulate loop in GEMM Stream K tiles
+@triton.jit
+def mac_loop(
+        # Pointers to matrices
+        a_ptr, b_ptr, c_ptr,
+        # Matrix dimensions
+        M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, stride_am: tl.constexpr, stride_ak: tl.constexpr,  #
+        stride_bk: tl.constexpr, stride_bn: tl.constexpr,  #
+        stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+        # Stream-K parameters
+        iters_per_tile, start_iter, end_iter,
+        # Meta-parameters
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+
     tile_id = start_iter // iters_per_tile
-    pid_m, pid_n = tile_id // tl.cdiv(N, BLOCK_N), tile_id % tl.cdiv(N, BLOCK_N)
+    remain_iters = start_iter % iters_per_tile
+    # if GROUP_SIZE_M > 0:
+    #     # pid swizzle to get better L2 cache performance
+    #     pid_m, pid_n = swizzle_tile(tile_id, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
+    # else:
+    pid_m, pid_n = linear_tile(tile_id, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    A = A + (rm[:, None] * stride_am + rk[None, :] * stride_ak) + BLOCK_K * stride_ak * (start_iter % iters_per_tile)
-    B = B + (rk[:, None] * stride_bk + rn[None, :] * stride_bn) + BLOCK_K * stride_bk * (start_iter % iters_per_tile)
-    
-    # A = A + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
-    # B = B + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    a_ptr += BLOCK_SIZE_K * stride_ak * remain_iters
+    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(stride_am, stride_ak),
+                                    offsets=(pid_m * BLOCK_SIZE_M, 0), block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+                                    order=(1, 0))
+    b_ptr += BLOCK_SIZE_K * stride_bk * remain_iters
+    b_block_ptr = tl.make_block_ptr(base=b_ptr, shape=(K, N), strides=(stride_bk, stride_bn),
+                                    offsets=(0, pid_n * BLOCK_SIZE_N), block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+                                    order=(1, 0))
 
-    for current_iter in range(start_iter, end_iter):
-        a = tl.load(A)
-        b = tl.load(B)
-        acc += tl.dot(a, b, out_dtype=ACC_TYPE)
-        A += BLOCK_K * stride_ak
-        B += BLOCK_K * stride_bk
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(start_iter, end_iter):
+        a = tl.load(a_block_ptr, boundary_check=(0, 1))
+        b = tl.load(b_block_ptr, boundary_check=(0, 1))
+        acc += tl.dot(a, b)
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
-    if end_iter % iters_per_tile == 0:  # last iteration of the tile always happens before its start on another SM
-        C_ = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)  # compute inside the if/else to avoid spilling!
-        tl.store(C_, acc)
-        if start_iter % iters_per_tile != 0:  # only if tile has been partially processed
-            tl.atomic_xchg(locks + tile_id, 1)
+    if remain_iters == 0 and end_iter % iters_per_tile == 0:
+        c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
+                                        offsets=(pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N),
+                                        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N), order=(1, 0))
+        tl.store(c_block_ptr, acc, boundary_check=(0, 1))
     else:
-        while tl.atomic_cas(locks + tile_id, 1, 1) != 1:
-            pass
-        C_ = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)  # compute inside the if/else to avoid spilling!
-        # tl.store(C_, acc)
-        tl.atomic_add(C_, acc)
+        rm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        rn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptr_ = c_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+        mask = (rm < M)[:, None] & (rn < N)[None, :]
+        tl.atomic_add(c_ptr_, acc, mask=mask)
 
 
-@triton.jit()
+@triton.jit
 def first_wave(
-    A, B, C,
-    M, N, K,
-    locks,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-    total_full_tiles_streamk, total_partial_tiles_streamk, iters_per_tile,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ACC_TYPE: tl.constexpr,
-    GROUP_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    start_iter = pid * total_full_tiles_streamk + tl.minimum(pid, total_partial_tiles_streamk)
-    last_iter = (pid + 1) * total_full_tiles_streamk + tl.minimum(pid + 1, total_partial_tiles_streamk)
+        # Pointers to matrices
+        a_ptr, b_ptr, c_ptr,
+        # Matrix dimensions
+        M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,  #
+        stride_am: tl.constexpr, stride_ak: tl.constexpr,  #
+        stride_bk: tl.constexpr, stride_bn: tl.constexpr,  #
+        stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+        # Stream-K parameters
+        full_tiles, partial_tiles, iters_per_tile,
+        # Meta-parameters
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+
+    pid = tl.program_id(axis=0)
+    start_iter = pid * full_tiles + tl.minimum(pid, partial_tiles)
+    last_iter = (pid + 1) * full_tiles + tl.minimum(pid + 1, partial_tiles)
 
     while start_iter < last_iter:
-        end_iter = tl.minimum(start_iter + (iters_per_tile - start_iter % iters_per_tile), last_iter)
-        mac_loop(A, B, C,
-                 M, N, K,
-                 locks,
-                 stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-                 iters_per_tile,
-                 start_iter, end_iter,
-                 BLOCK_M, BLOCK_N, BLOCK_K, ACC_TYPE,
-                 GROUP_M,
-                 )
-        
+        end_iter = start_iter + (iters_per_tile - start_iter % iters_per_tile)
+        end_iter = tl.minimum(end_iter, last_iter)
+        mac_loop(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                 iters_per_tile, start_iter, end_iter, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M)
+
         start_iter = end_iter
 
 
 
-m, n, k = 16, 16384, 8192  # some problem size to test
+m, n, k = 512, 512, 512  # some problem size to test
 
 total_sm = 108
 
@@ -96,55 +112,41 @@ torch.random.manual_seed(0)
 A = torch.randn(m, k, device="cuda", dtype=torch.float32)
 B = torch.randn(k, n, device="cuda", dtype=torch.float32)
 
-BLK_M = 16
-BLK_N = 128
-BLK_K = 32
+streamk_programs = total_sm
+BLOCK_SIZE_M = 32
+BLOCK_SIZE_N = 64
+BLOCK_SIZE_K = 32
 two_tiles = False
 M, K = A.shape
-_, N = B.shape
+K, N = B.shape
 # accumulator types
 ACC_TYPE = tl.float32 if A.dtype in [torch.float32, torch.bfloat16, torch.float32] else tl.int32
 # compute grid (work to do per SM on the first wave)
-total_blocks_M = triton.cdiv(M, BLK_M)
-total_blocks_N = triton.cdiv(N, BLK_N)
-iters_per_tile = triton.cdiv(K, BLK_K)
-GROUP_M = 8  # 0 to disable swizzling
-total_tiles = total_blocks_M * total_blocks_N
-total_programs_streamk = total_sm
-if total_programs_streamk > 0:  # Stream-K
-    # last wave may occupy less than total_programs_streamk SMs
-    total_tiles_streamk = total_tiles % total_programs_streamk
-    # for two-tile Stream-K + data-parallel from original paper
-    if two_tiles and total_tiles - total_tiles_streamk > total_programs_streamk:
-        total_tiles_streamk += total_programs_streamk
-    # remaining tiles are computed using classical blocking
-    total_blocking_tiles = total_tiles - total_tiles_streamk
-    total_iters_streamk = total_tiles_streamk * iters_per_tile
-    # iterations related to full waves
-    total_full_tiles_streamk = total_iters_streamk // total_programs_streamk
-    # iterations related to last (partial) wave
-    total_partial_tiles_streamk = total_iters_streamk % total_programs_streamk
-else:  # all tiles are computed using classical blocking
-    total_blocking_tiles = total_tiles
-    total_tiles_streamk = 0
-    total_full_tiles_streamk = 0
-    total_partial_tiles_streamk = 0
-    total_iters_streamk = 0
+num_block_m = triton.cdiv(M, BLOCK_SIZE_M)
+num_block_n = triton.cdiv(N, BLOCK_SIZE_N)
+iters_per_tile = triton.cdiv(K, BLOCK_SIZE_K)
+total_tiles = num_block_m * num_block_n
 
-print(f"{total_tiles_streamk=} ")
-print(f"{total_blocking_tiles=} ")
+# Two-tile SK + DP
+streamk_tiles = total_tiles % streamk_programs
+if total_tiles - streamk_tiles > streamk_programs:  # (total_tiles // total_programs > 1)
+    streamk_tiles += streamk_programs
+
+blocking_tiles = total_tiles - streamk_tiles
+streamk_iters = streamk_tiles * iters_per_tile
+
+streamk_full_tiles = streamk_iters // streamk_programs
+streamk_partial_tiles = streamk_iters % streamk_programs
+
 print(f"{total_tiles=} ")
-print(f"{total_iters_streamk=} ")
-print(f"{total_full_tiles_streamk=} ")
 print(f"{iters_per_tile=} ")
 
-locks = torch.zeros((total_tiles_streamk,), device="cuda", dtype=torch.int32)
 
 def tl_matmul(
     M,
     N,
     K,
-    total_tiles_streamk,
+    streamk_programs,
     block_M,
     block_N,
     block_K,
@@ -164,8 +166,8 @@ def tl_matmul(
     import tvm.tl.language as T
     
     @T.prim_func
-    def main(A: T.Buffer(A_shape, dtypeAB), B: T.Buffer(B_shape, dtypeAB), C: T.Buffer((M, N), dtypeC), locks: T.Buffer((total_tiles_streamk,), "int32")):
-        with T.Kernel(total_sm, threads=threads) as pid:
+    def main(A: T.Buffer(A_shape, dtypeAB), B: T.Buffer(B_shape, dtypeAB), C: T.Buffer((M, N), dtypeC)):
+        with T.Kernel(streamk_programs, threads=threads) as pid:
             
             A_shared = T.alloc_shared(A_shared_shape, dtypeAB)
             B_shared = T.alloc_shared(B_shared_shape, dtypeAB)
@@ -174,13 +176,14 @@ def tl_matmul(
             start_iter = T.alloc_fragment((1, ), "int32", "local")
             end_iter = T.alloc_fragment((1, ), "int32", "local")
 
-            start_iter[0] = pid * total_full_tiles_streamk + T.min(pid, total_partial_tiles_streamk)
-            last_iter = (pid + 1) * total_full_tiles_streamk + T.min(pid + 1, total_partial_tiles_streamk)
+            start_iter[0] = pid * streamk_full_tiles + T.min(pid, streamk_partial_tiles)
+            last_iter = (pid + 1) * streamk_full_tiles + T.min(pid + 1, streamk_partial_tiles)
             
             while start_iter[0] < last_iter:
                 end_iter[0] = T.min(start_iter[0] + (iters_per_tile - (start_iter[0] % iters_per_tile)), last_iter)
                 
                 tile_id = start_iter[0] // iters_per_tile
+                remain_iters = start_iter[0] % iters_per_tile
                 pid_m = tile_id // T.ceildiv(N, block_N)
                 pid_n = tile_id % T.ceildiv(N, block_N)
                 
@@ -191,22 +194,17 @@ def tl_matmul(
                     T.gemm(A_shared, B_shared, C_local)
 
                 # last iteration of the tile always happens before its start on another SM
-                if end_iter[0] % iters_per_tile == 0:
+                if remain_iters == 0 and (end_iter[0] % iters_per_tile == 0):
                     T.copy(C_local, C[pid_m * block_M, pid_n * block_N])
-                    if start_iter[0] % iters_per_tile: 
-                        # only if tile has been partially processed
-                        T.call_extern("handle", "atomicExch", T.address_of(locks[tile_id]), 1)
                 else:
-                    T.call_extern("handle", "acquire_lock", T.address_of(locks[tile_id]))
                     for i, j in T.Parallel(block_M, block_N):
                         T.atomic_add(C[pid_m * block_M + i, pid_n * block_N + j], C_local[i, j])
 
                 start_iter[0] = end_iter[0]
             
-
     return main
 
-_tl_matmul = tl_matmul(m, n, k, total_tiles_streamk, 16, 128, 32, False, False, "float32", "float32", "float32", 2, 128)
+_tl_matmul = tl_matmul(m, n, k, streamk_programs, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, False, False, "float32", "float32", "float32", 2, 128)
 print(_tl_matmul)
 
 @tvm.register_func(func_name="tvm_callback_cuda_postproc", override=True)
@@ -218,29 +216,27 @@ mod = TL.Profiler(mod, params, [], TL.TensorSupplyType.Integer)
 
 C = torch.zeros((m, n), device="cuda", dtype=torch.float32)
 
-print("total_tiles_streamk", total_tiles_streamk)
+print("streamk_programs", streamk_programs)
 
-k2 = first_wave[(total_blocking_tiles,)](
+k2 = first_wave[(streamk_programs,)](
     A,
     B,
     C,
     M,
     N,
     K,
-    locks,
     A.stride(0),
     A.stride(1),
     B.stride(0),
     B.stride(1),
     C.stride(0),
     C.stride(1),
-    total_full_tiles_streamk,
-    total_partial_tiles_streamk,
+    streamk_full_tiles,
+    streamk_partial_tiles,
     iters_per_tile,
-    16,
-    128,
-    32,
-    tl.float32,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_K,
     4
 )
 
@@ -250,8 +246,7 @@ b_c = torch.zeros((m, n), device="cuda", dtype=torch.float32)
 
 print("mod source:", mod.mod.imported_modules[0].get_source())
 
-locks = torch.zeros((total_tiles_streamk,), device="cuda", dtype=torch.int32)
-mod(A, B, b_c, locks)
+mod(A, B, b_c)
 
 print("b_c: ", b_c)
 
