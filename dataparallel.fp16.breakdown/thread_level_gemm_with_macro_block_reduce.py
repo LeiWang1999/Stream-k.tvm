@@ -11,7 +11,7 @@ from bitblas.tl.macro_generator import TensorCorePTXMacroGenerator
 
 torch.manual_seed(0)
 
-VERIFY_CORRECTNESS = False
+VERIFY_CORRECTNESS = True
 in_dtype = "float16"
 accum_dtype = "float16"
 # accum_dtype = "float16"
@@ -28,12 +28,13 @@ config = bitblas.base.Hint.from_dict(
         "block": [128, 256],
         "warp": [64, 128],
         "rstep": [32],
-        "pipeline_stage": 2,
+        "pipeline_stage": 1,
         "use_async": False,
         "intrin_info": intrin_info,
         "shared_scope": "shared.dyn",
         "vectorize": {"b": 8, "a": 8},
         "rasterization_plan": Rasterization2DColumn(10),
+        "block_reduction_depth": 2,
     }
 )
 
@@ -45,6 +46,8 @@ block_col_warps = config.block[1] // warp_col_tiles
 stage = config.pipeline_stage
 use_async = config.use_async
 chunk = config.rstep[0]
+reduce_k = config.block_reduction_depth
+
 # tensor core intrinsic size
 shared_scope = config.shared_scope
 micro_size_x, micro_size_y, micro_size_k = 16, 16, 16
@@ -69,8 +72,14 @@ import tvm.tl.language as T
 
 
 def make_swizzle_layout(shared_buf):
+    from tvm import DataType
     dtype = shared_buf.dtype
     shape = shared_buf.shape
+
+    can_swizzle = shape[-1] * DataType(dtype).bits == 512
+    if not can_swizzle:
+        print(f"shape is not swizzlable: {shape} {dtype}")
+        return T.Layout(shape, lambda *args: args)
 
     def transform_func(i, j):
         new_warp_i, new_warp_j = get_swizzle_layout(i, j, shape[-1], dtype)
@@ -90,7 +99,7 @@ def tl_matmul(
 
     block_M = block_row_warps * warp_row_tiles
     block_N = block_col_warps * warp_col_tiles
-    block_K = chunk
+    block_K = reduce_k * chunk
 
     A_shape = (M, K)
     B_shape = (N, K)
@@ -108,7 +117,7 @@ def tl_matmul(
         a_dtype=dtypeAB, b_dtype=dtypeAB, accum_dtype=accum_dtype,
         a_transposed=False, b_transposed=True, block_row_warps=block_row_warps,
         block_col_warps=block_col_warps, warp_row_tiles=warp_row_tiles,
-        warp_col_tiles=warp_col_tiles, chunk=chunk
+        warp_col_tiles=warp_col_tiles, chunk=chunk, reduce_k=reduce_k
     )
 
     @T.prim_func
@@ -127,14 +136,20 @@ def tl_matmul(
             A_local = T.alloc_fragment((warp_rows * local_size), dtypeAB, scope="local")
             B_local = T.alloc_fragment((warp_cols * local_size), dtypeAB, scope="local")
             C_local = T.alloc_fragment((warp_rows * warp_cols * local_size), accum_dtype, scope="local")
-            thread_bindings = T.thread_binding(0, threads, "threadIdx.x")
-
-            T.annotate_layout(
-                {
-                    A_shared: make_swizzle_layout(A_shared),
-                    B_shared: make_swizzle_layout(B_shared),
-                }
+            reduced_accum_res = T.alloc_fragment(
+                0, accum_dtype, scope="local"
             )
+            thread_bindings = T.thread_binding(0, threads, "threadIdx.x")
+            
+            rk =  T.thread_binding(0, reduce_k, "threadIdx.y")
+
+            # if block_K == 32: # Swizzling only works for chunk size 32
+            #     T.annotate_layout(
+            #         {
+            #             A_shared: make_swizzle_layout(A_shared),
+            #             B_shared: make_swizzle_layout(B_shared),
+            #         }
+            #     )
 
             T.use_swizzle(panel_size=10)
 
@@ -143,14 +158,16 @@ def tl_matmul(
             for ko in T.Pipelined((K // block_K), num_stages=stage):
 
                 # Load A into shared memory
-                for i, k in T.Parallel(block_M, block_K):
-                    A_shared[i, k] = A[by * block_M + i, ko * block_K + k]
+                for i, k in T.Parallel(block_M, (block_K // reduce_k)):
+                    vk = rk * (block_K // reduce_k) + k
+                    A_shared[i, vk] = A[by * block_M + i, ko * block_K + vk]
 
                 # Load B into shared memory
-                for j, k in T.Parallel(block_N, block_K):
-                    B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
+                for j, k in T.Parallel(block_N, (block_K // reduce_k)):
+                    vk = rk * (block_K // reduce_k) + k
+                    B_shared[j, vk] = B[bx * block_N + j, ko * block_K + vk]
 
-                for ki in T.serial(0, (block_K // micro_size_k)):
+                for ki in T.serial(0, (block_K // (micro_size_k * reduce_k))):
 
                     # Load A into fragment
                     ptx_macro_generator.LDMATRIX_A(
@@ -159,6 +176,7 @@ def tl_matmul(
                         A_shared,
                         ki,
                         thread_bindings=thread_bindings,
+                        rk=rk,
                     )
 
                     # Load B into fragment
@@ -168,6 +186,7 @@ def tl_matmul(
                         B_shared,
                         ki,
                         thread_bindings=thread_bindings,
+                        rk=rk,
                     )
 
                     ptx_macro_generator.MMA(
@@ -177,13 +196,33 @@ def tl_matmul(
                         C_local
                     )
 
+            for n in T.serial(warp_rows * warp_cols * local_size):
+                T.attr(
+                    T.comm_reducer(lambda x, y: x + y, [T.float16(0)]),
+                    "reduce_scope",
+                    T.reinterpret(T.uint64(0), dtype="handle"),
+                )
+                T.evaluate(
+                    T.tvm_thread_allreduce(
+                        T.uint32(1),
+                        C_local[n],
+                        True,
+                        reduced_accum_res[0],
+                        rk,
+                        dtype="handle",
+                    )
+                )
+                if rk == 0:
+                    C_local[n] = reduced_accum_res[0]
+            
+
+            # if rk == 0:
             ptx_macro_generator.STMATRIX(
                 ptx_macro_generator,
                 C_local,
                 C_shared,
                 thread_bindings=thread_bindings,
             )
-
             for i, j in T.Parallel(block_M, block_N):
                 C[by * block_M + i, bx * block_N + j] = C_shared[i // micro_size_x, j // micro_size_y, i % micro_size_x, j % micro_size_y]
 
@@ -195,9 +234,10 @@ matmul = tl_matmul(M, N, K, in_dtype, accum_dtype, accum_dtype)
 print(matmul)
 
 
-@tvm.register_func(func_name="tvm_callback_cuda_postproc", override=True)
-def tvm_callback_cuda_postproc(code, _):
-    return code
+# @tvm.register_func(func_name="tvm_callback_cuda_postproc", override=True)
+# def tvm_callback_cuda_postproc(code, _):
+#     code = code.replace("(volatile half_t*)", "(volatile half*)")
+#     return code
 
 
 mod, params = TL.lower(matmul)
