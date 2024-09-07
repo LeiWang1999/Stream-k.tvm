@@ -9,5 +9,8 @@ pip install git+https://github.com/microsoft/BitBLAS.git
 ```
 
 TODO Items:
-- [ ] Implement Float16 Tensor Core
+- [x] Implement Float16 Tensor Core
+- [x] With Vectorized AtomicAdd
+- [x] Implement Auto Tune
+- [ ] With BlockReduction 
 - [ ] Implement Dequantize template and integrate with BitBLAS
