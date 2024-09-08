@@ -13,5 +13,6 @@ TODO Items:
 - [x] With Vectorized AtomicAdd
 - [x] Implement Auto Tune
 - [x] With BlockReduction 
-- [ ] With Ladder Layout Propagation.
-- [ ] Implement Dequantize template and integrate with BitBLAS
+- [x] With Ladder Layout Propagation.
+- [ ] Apply Padding when the tile shape is not aligned for Swizzling.
+- [ ] Implement Dequantize template and integrate with BitBLAS.
