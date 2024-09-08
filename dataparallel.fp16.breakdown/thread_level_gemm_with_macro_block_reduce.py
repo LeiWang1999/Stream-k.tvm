@@ -143,13 +143,13 @@ def tl_matmul(
             
             rk =  T.thread_binding(0, reduce_k, "threadIdx.y")
 
-            # if block_K == 32: # Swizzling only works for chunk size 32
-            #     T.annotate_layout(
-            #         {
-            #             A_shared: make_swizzle_layout(A_shared),
-            #             B_shared: make_swizzle_layout(B_shared),
-            #         }
-            #     )
+            if block_K == 32: # Swizzling only works for chunk size 32
+                T.annotate_layout(
+                    {
+                        A_shared: make_swizzle_layout(A_shared),
+                        B_shared: make_swizzle_layout(B_shared),
+                    }
+                )
 
             T.use_swizzle(panel_size=10)
 

@@ -12,5 +12,6 @@ TODO Items:
 - [x] Implement Float16 Tensor Core
 - [x] With Vectorized AtomicAdd
 - [x] Implement Auto Tune
-- [ ] With BlockReduction 
+- [x] With BlockReduction 
+- [ ] With Ladder Layout Propagation.
 - [ ] Implement Dequantize template and integrate with BitBLAS
