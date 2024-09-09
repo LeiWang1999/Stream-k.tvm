@@ -28,7 +28,7 @@ config = bitblas.base.Hint.from_dict(
         "block": [128, 256],
         "warp": [64, 128],
         "rstep": [32],
-        "pipeline_stage": 1,
+        "pipeline_stage": 2,
         "use_async": False,
         "intrin_info": intrin_info,
         "shared_scope": "shared.dyn",

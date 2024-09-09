@@ -14,5 +14,5 @@ TODO Items:
 - [x] Implement Auto Tune
 - [x] With BlockReduction 
 - [x] With Ladder Layout Propagation.
-- [ ] Apply Padding when the tile shape is not aligned for Swizzling.
+- [x] Apply Padding when the tile shape is not aligned for Swizzling.
 - [ ] Implement Dequantize template and integrate with BitBLAS.

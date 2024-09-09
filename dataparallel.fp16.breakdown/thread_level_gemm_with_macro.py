@@ -11,7 +11,7 @@ from bitblas.tl.macro_generator import TensorCorePTXMacroGenerator
 
 torch.manual_seed(0)
 
-VERIFY_CORRECTNESS = False
+VERIFY_CORRECTNESS = True
 in_dtype = "float16"
 accum_dtype = "float16"
 # accum_dtype = "float16"
@@ -25,8 +25,8 @@ intrin_info = bitblas.base.hint.IntrinInfo(
 config = bitblas.base.Hint.from_dict(
     {
         "arch": arch,
-        "block": [128, 256],
-        "warp": [64, 128],
+        "block": [16, 64],
+        "warp": [16, 16],
         "rstep": [32],
         "pipeline_stage": 2,
         "use_async": False,
@@ -58,7 +58,7 @@ K = 16384
 if VERIFY_CORRECTNESS:
     M = 256
     N = 512
-    K = 128
+    K = 32
 
 A = torch.rand(M, K, device="cuda", dtype=getattr(torch, in_dtype))
 B = torch.rand(N, K, device="cuda", dtype=getattr(torch, in_dtype))
