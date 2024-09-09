@@ -146,7 +146,7 @@ def tl_matmul_streamk(
             warp_row_tiles=warp_row_tiles,
             warp_col_tiles=warp_col_tiles,
             chunk=chunk,
-            threads=threads,
+            
         )
 
         @T.macro
@@ -228,12 +228,12 @@ def tl_matmul_streamk(
                             ptx_macro_generator, A_buf_local, B_buf_local, C_buf_local
                         )
 
-                    ptx_macro_generator.STMATRIX(
-                        ptx_macro_generator,
-                        C_buf_local,
-                        C_buf_shared,
-                        thread_bindings=thread_bindings,
-                    )
+                ptx_macro_generator.STMATRIX(
+                    ptx_macro_generator,
+                    C_buf_local,
+                    C_buf_shared,
+                    thread_bindings=thread_bindings,
+                )
 
                 # last iteration of the tile always happens before its start on another SM
                 if remain_iters == 0 and (end_iter[0] % iters_per_tile == 0):
