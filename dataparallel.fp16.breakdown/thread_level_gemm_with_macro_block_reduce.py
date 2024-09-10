@@ -223,8 +223,10 @@ def tl_matmul(
                     C_shared,
                     thread_bindings=thread_bindings,
                 )
-                for i, j in T.Parallel(block_M, block_N):
-                    C[by * block_M + i, bx * block_N + j] = C_shared[i // micro_size_x, j // micro_size_y, i % micro_size_x, j % micro_size_y]
+
+            for i, j in T.Parallel(block_M, (block_N // reduce_k)):
+                vj = rk * (block_N // reduce_k) + j
+                C[by * block_M + i, bx * block_N + vj] = C_shared[i // micro_size_x, vj // micro_size_y, i % micro_size_x, vj % micro_size_y]
 
     return main
 

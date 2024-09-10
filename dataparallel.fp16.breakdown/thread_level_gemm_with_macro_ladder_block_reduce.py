@@ -27,7 +27,7 @@ config = bitblas.base.Hint.from_dict(
         "arch": arch,
         "block": [128, 128],
         "warp": [64, 64],
-        "rstep": [32],
+        "rstep": [32], 
         "pipeline_stage": 2,
         "use_async": False,
         "intrin_info": intrin_info,
