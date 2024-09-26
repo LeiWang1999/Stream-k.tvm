@@ -180,13 +180,6 @@ def tl_matmul(
                     vk = rk * (block_K // reduce_k) + k
                     A_shared[i, vk] = A[by * block_M + i, ko * block_K + vk]
 
-                # Load B into shared memory
-                # for j, k, jj, kk in T.Parallel(
-                #     (block_N // micro_size_y), block_K // micro_size_k, micro_size_y, micro_size_k // num_elems_per_byte
-                # ):
-                #     vk = rk * (block_K // reduce_k // micro_size_k) + k
-                #     B_shared[j, vk, jj, kk] = B[bx * (block_N // micro_size_y) + j, ko * (block_K // micro_size_k) + vk, jj, kk]
-                
                 # TODO(lei): Layout Inference Pass is not efficient to handle the four dims int8 load
                 for i in T.serial(block_N * (block_K // reduce_k) // num_elems_per_byte // (threads * vec_load_qb)):
                     for v in T.vectorized(0, vec_load_qb):

@@ -11,7 +11,7 @@ from bitblas.tl.utils import get_swizzle_layout
 from bitblas.tl.macro_generator import TensorCoreIntrinEmitterWithLadderTransform
 torch.manual_seed(0)
 
-VERIFY_CORRECTNESS = False
+VERIFY_CORRECTNESS = True
 in_dtype = "float16"
 accum_dtype = "float16"
 # accum_dtype = "float16"
@@ -25,8 +25,8 @@ intrin_info = bitblas.base.hint.IntrinInfo(
 config = bitblas.base.Hint.from_dict(
     {
         "arch": arch,
-        "block": [128, 256],
-        "warp": [64, 128],
+        "block": [64, 64],
+        "warp": [32, 32],
         "rstep": [64],
         "pipeline_stage": 2,
         "use_async": False,

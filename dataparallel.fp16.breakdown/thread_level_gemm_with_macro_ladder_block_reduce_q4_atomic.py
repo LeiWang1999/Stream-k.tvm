@@ -17,7 +17,7 @@ num_bits = 4
 num_elems_per_byte = 8 // num_bits
 storage_dtype = "int8"
 
-VERIFY_CORRECTNESS = False
+VERIFY_CORRECTNESS = True
 in_dtype = "float16"
 accum_dtype = "float16"
 # accum_dtype = "float16"
