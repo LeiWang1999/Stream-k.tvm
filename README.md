@@ -17,5 +17,5 @@ TODO Items:
 - [x] Apply Padding when the tile shape is not aligned for Swizzling.
 - [x] Implement Q4.
 - [x] Implement with BitBLAS Fast Dequantize.
-- [ ] Enhance TL Thread Level MMA Abstraction.
+- [ ] Enhance TL Thread Level mma Abstraction.
 - [ ] Implement Dequantize template and integrate with BitBLAS.

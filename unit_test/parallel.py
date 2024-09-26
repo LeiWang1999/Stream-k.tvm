@@ -7,7 +7,7 @@ from bitblas.base.arch import CUDA
 from bitblas.base.roller.rasterization import Rasterization2DColumn
 from bitblas.utils import auto_detect_nvidia_target
 from bitblas.tl.utils import get_swizzle_layout
-from bitblas.tl.macro_generator import TensorCorePTXMacroGenerator
+from bitblas.tl.macro_generator import TensorCoreIntrinEmitter
 
 torch.manual_seed(0)
 
@@ -104,7 +104,7 @@ def tl_matmul(
     warp_rows = warp_row_tiles // micro_size_x
     warp_cols = warp_col_tiles // micro_size_y
 
-    ptx_macro_generator = TensorCorePTXMacroGenerator(
+    mma_emitter = TensorCoreIntrinEmitter(
         a_dtype=dtypeAB, b_dtype=dtypeAB, accum_dtype=accum_dtype,
         a_transposed=False, b_transposed=True, block_row_warps=block_row_warps,
         block_col_warps=block_col_warps, warp_row_tiles=warp_row_tiles,
@@ -153,8 +153,7 @@ def tl_matmul(
                 for ki in T.serial(0, (block_K // micro_size_k)):
 
                     # Load A into fragment
-                    ptx_macro_generator.LDMATRIX_A(
-                        ptx_macro_generator,
+                    mma_emitter.ldmatrix_a(
                         A_local,
                         A_shared,
                         ki,
@@ -162,23 +161,20 @@ def tl_matmul(
                     )
 
                     # Load B into fragment
-                    ptx_macro_generator.LDMATRIX_B(
-                        ptx_macro_generator,
+                    mma_emitter.ldmatrix_b(
                         B_local,
                         B_shared,
                         ki,
                         thread_bindings=thread_bindings,
                     )
 
-                    ptx_macro_generator.MMA(
-                        ptx_macro_generator,
+                    mma_emitter.mma(
                         A_local,
                         B_local,
                         C_local
                     )
 
-            ptx_macro_generator.STMATRIX(
-                ptx_macro_generator,
+            mma_emitter.stmatrix(
                 C_local,
                 C_shared,
                 thread_bindings=thread_bindings,

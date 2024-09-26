@@ -9,7 +9,7 @@ from bitblas.base.roller.rasterization import Rasterization2DColumn
 from bitblas.utils import auto_detect_nvidia_target
 from bitblas.tl.utils import get_swizzle_layout
 from bitblas.quantization import _tir_packed_to_unsigned_convert
-from bitblas.tl.macro_generator import TensorCorePTXMacroGeneratorWithLadderTransform
+from bitblas.tl.macro_generator import TensorCoreIntrinEmitterWithLadderTransform
 from bitblas.gpu.intrin.lop3 import decode_i4_to_f16
 torch.manual_seed(0)
 
@@ -124,7 +124,7 @@ def tl_matmul(
     warp_rows = warp_row_tiles // micro_size_x
     warp_cols = warp_col_tiles // micro_size_y
 
-    ptx_macro_generator = TensorCorePTXMacroGeneratorWithLadderTransform(
+    mma_emitter = TensorCoreIntrinEmitterWithLadderTransform(
         a_dtype=dtypeAB, b_dtype=dtypeAB, accum_dtype=accum_dtype,
         a_transposed=False, b_transposed=True, block_row_warps=block_row_warps,
         block_col_warps=block_col_warps, warp_row_tiles=warp_row_tiles,
@@ -193,8 +193,7 @@ def tl_matmul(
                 for ki in T.serial(0, (block_K // micro_size_k)):
 
                     # Load A into fragment
-                    ptx_macro_generator.LDMATRIX_A(
-                        ptx_macro_generator,
+                    mma_emitter.ldmatrix_a(
                         A_local,
                         A_shared,
                         ki,
@@ -202,8 +201,7 @@ def tl_matmul(
                     )
 
                     # Load B into fragment
-                    ptx_macro_generator.LDMATRIX_B(
-                        ptx_macro_generator,
+                    mma_emitter.ldmatrix_b(
                         B_local,
                         B_shared,
                         ki,
@@ -211,20 +209,18 @@ def tl_matmul(
                     )
 
                     for j in T.serial(warp_cols):
-                        local_size_b = ptx_macro_generator.local_size_b
+                        local_size_b = mma_emitter.local_size_b
                         T.call_extern('handle', 'decode_i4u_to_f16', T.address_of(B_local[j * local_size_b // num_elems_per_byte]), 
                                            T.address_of(B_dequantize_local[j * local_size_b]), 8)
         
 
-                    ptx_macro_generator.MMA(
-                        ptx_macro_generator,
+                    mma_emitter.mma(
                         A_local,
                         B_dequantize_local,
                         C_local
                     )
 
-            ptx_macro_generator.STMATRIX(
-                ptx_macro_generator,
+            mma_emitter.stmatrix(
                 C_local,
                 C_shared,
                 thread_bindings=thread_bindings,

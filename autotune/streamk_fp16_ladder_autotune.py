@@ -7,7 +7,7 @@ from tvm import tl as TL
 from bitblas.base.arch import CUDA
 from tvm import DataType
 from bitblas.tl.utils import get_swizzle_layout
-from bitblas.tl.macro_generator import TensorCorePTXMacroGeneratorWithLadderTransform
+from bitblas.tl.macro_generator import TensorCoreIntrinEmitterWithLadderTransform
 
 # disable tf32
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -144,7 +144,7 @@ def tl_matmul_streamk(
             micro_size_y,
         )
 
-        ptx_macro_generator = TensorCorePTXMacroGeneratorWithLadderTransform(
+        mma_emitter = TensorCoreIntrinEmitterWithLadderTransform(
             a_dtype=dtypeAB,
             b_dtype=dtypeAB,
             accum_dtype=accum_dtype,
@@ -224,29 +224,26 @@ def tl_matmul_streamk(
                     for ki in T.serial(0, (BLOCK_SIZE_K // micro_size_k)):
 
                         # Load A into fragment
-                        ptx_macro_generator.LDMATRIX_A(
-                            ptx_macro_generator,
-                            A_buf_local,
+                        mma_emitter.ldmatrix_a(
+                                A_buf_local,
                             A_buf_shared,
                             ki,
                             thread_bindings=thread_bindings,
                         )
 
                         # Load B into fragment
-                        ptx_macro_generator.LDMATRIX_B(
-                            ptx_macro_generator,
-                            B_buf_local,
+                        mma_emitter.ldmatrix_b(
+                                B_buf_local,
                             B_buf_shared,
                             ki,
                             thread_bindings=thread_bindings,
                         )
 
-                        ptx_macro_generator.MMA(
-                            ptx_macro_generator, A_buf_local, B_buf_local, C_buf_local
+                        mma_emitter.mma(
+                            mma_emitter, A_buf_local, B_buf_local, C_buf_local
                         )
 
-                ptx_macro_generator.STMATRIX(
-                    ptx_macro_generator,
+                mma_emitter.stmatrix(
                     C_buf_local,
                     C_buf_shared,
                     thread_bindings=thread_bindings,
@@ -316,32 +313,28 @@ def tl_matmul_streamk(
                     for ki in T.serial(0, (BLOCK_SIZE_K // micro_size_k)):
 
                         # Load A into fragment
-                        ptx_macro_generator.LDMATRIX_A(
-                            ptx_macro_generator,
-                            A_buf_local,
+                        mma_emitter.ldmatrix_a(
+                                A_buf_local,
                             A_buf_shared,
                             ki,
                             thread_bindings=thread_bindings,
                         )
 
                         # Load B into fragment
-                        ptx_macro_generator.LDMATRIX_B(
-                            ptx_macro_generator,
-                            B_buf_local,
+                        mma_emitter.ldmatrix_b(
+                                B_buf_local,
                             B_buf_shared,
                             ki,
                             thread_bindings=thread_bindings,
                         )
 
-                        ptx_macro_generator.MMA(
-                            ptx_macro_generator,
-                            A_buf_local,
+                        mma_emitter.mma(
+                                A_buf_local,
                             B_buf_local,
                             C_buf_local
                         )
 
-                ptx_macro_generator.STMATRIX(
-                    ptx_macro_generator,
+                mma_emitter.stmatrix(
                     C_buf_local,
                     C_buf_shared,
                     thread_bindings=thread_bindings,

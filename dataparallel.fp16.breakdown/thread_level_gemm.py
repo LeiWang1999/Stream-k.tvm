@@ -148,13 +148,13 @@ def tl_matmul(
                         T.ptx_ldmatrix("float16", T.bool(False), 4, ".b16", B_local.data, j * local_size,
                             T.address_of(B_shared[tz * warp_col_tiles + j * micro_size_y, ki * micro_size_k]), get_ldmatrix_offset("B", tx, 0, block_K, "float16", True))
 
-                    # Apply MMA
+                    # Apply mma
                     for i, j in T.grid(warp_rows, warp_cols,):
                         T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size, C_local.data, i * warp_cols * local_size + j * local_size, T.bool(False),)
                         T.ptx_mma("float32", "m16n8k16", "row", "col", "fp16", "fp16", "fp32", A_local.data, i * local_size, B_local.data, j * local_size + 4, C_local.data, i * warp_cols * local_size + j * local_size + 4, T.bool(False))
 
             # STS
-            # MMA Store must be in simulated instead of TVM Intrins
+            # mma Store must be in simulated instead of TVM Intrins
             # As TVM Intrins is like a hack that the threadIdx.x should be always
             # equal to the warp_size
             for i, j in T.grid(warp_rows, warp_cols):
