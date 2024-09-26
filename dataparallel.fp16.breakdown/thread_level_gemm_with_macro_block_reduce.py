@@ -45,8 +45,8 @@ block_row_warps = config.block[0] // warp_row_tiles
 block_col_warps = config.block[1] // warp_col_tiles
 stage = config.pipeline_stage
 use_async = config.use_async
-chunk = config.rstep[0]
 reduce_k = config.block_reduction_depth
+chunk = config.rstep[0] // reduce_k
 
 # tensor core intrinsic size
 shared_scope = config.shared_scope

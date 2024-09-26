@@ -9,10 +9,11 @@ pip install git+https://github.com/microsoft/BitBLAS.git
 ```
 
 TODO Items:
-- [x] Implement Float16 Tensor Core
-- [x] With Vectorized AtomicAdd
-- [x] Implement Auto Tune
-- [x] With BlockReduction 
+- [x] Implement Float16 Tensor Core.
+- [x] With Vectorized AtomicAdd.
+- [x] Implement Auto Tune.
+- [x] With BlockReduction.
 - [x] With Ladder Layout Propagation.
 - [x] Apply Padding when the tile shape is not aligned for Swizzling.
+- [ ] Implement Q4.
 - [ ] Implement Dequantize template and integrate with BitBLAS.

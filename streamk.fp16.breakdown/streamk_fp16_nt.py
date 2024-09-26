@@ -12,9 +12,7 @@ def cdiv(a, b):
 # disable tf32
 torch.backends.cuda.matmul.allow_tf32 = False
 
-m = 256
-n = 1024
-k = 512
+m, n, k = 16, 16384, 8192  # some problem size to test
 
 total_sm = 108
 
@@ -24,8 +22,8 @@ A = torch.rand(m, k, device="cuda", dtype=torch.float16) * 2 - 1
 B = torch.rand(n, k, device="cuda", dtype=torch.float16) * 2 - 1
 
 streamk_programs = total_sm
-BLOCK_SIZE_M = 16
-BLOCK_SIZE_N = 128
+BLOCK_SIZE_M = 32
+BLOCK_SIZE_N = 64
 BLOCK_SIZE_K = 32
 two_tiles = False
 M, K = A.shape
@@ -110,7 +108,7 @@ def tl_matmul_streamk(
             pid_n = tile_id % T.ceildiv(N, block_N)
 
             T.clear(C_local)
-            for k in T.Pipelined(end_iter[0] - start_iter[0], num_stages=1):
+            for k in T.serial(0, end_iter[0] - start_iter[0]):
                 T.copy(
                     A_buf[
                         pid_m * block_M,
@@ -164,14 +162,12 @@ def tl_matmul_streamk(
             pid_m = tile_id // T.ceildiv(N, block_N)
             pid_n = tile_id % T.ceildiv(N, block_N)
             T.clear(C_local)
-            # for k in T.serial(T.ceildiv(K, block_K), annotations={
-            #     "software_pipeline_stage": [0, 0, 1],
-            #     "software_pipeline_order": [0, 1, 2],
-            #     "software_pipeline_async_stages": [0]
-            # }):
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=1):
+            for k in T.serial(T.ceildiv(K, block_K)):
                 T.copy(A_buf[pid_m * block_M, k * block_K], A_shared)
-                T.copy(B_buf[pid_n * block_N, k * block_K], B_shared)
+                if trans_B:
+                    T.copy(B_buf[pid_n * block_N, k * block_K], B_shared)
+                else:
+                    T.copy(B_buf[k * block_K, pid_n * block_N], B_shared)
                 T.gemm(A_shared, B_shared, C_local, transpose_B=trans_B)
             T.copy(C_local, C[pid_m * block_M, pid_n * block_N])
 
@@ -185,14 +181,13 @@ def tl_matmul_streamk(
 
             A_shared = T.alloc_shared(A_shared_shape, dtypeAB)
             B_shared = T.alloc_shared(B_shared_shape, dtypeAB)
-            A_shared_full_tiles = T.alloc_shared(A_shared_shape, dtypeAB)
-            B_shared_full_tiles = T.alloc_shared(B_shared_shape, dtypeAB)
+
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             
             compute_first_wave(pid, A, A_shared, B, B_shared, C, C_local)
-            
+
             if sm_patition_factor > 0:
-                compute_full_tiles(pid, A, A_shared_full_tiles, B, B_shared_full_tiles, C, C_local)
+                compute_full_tiles(pid, A, A_shared, B, B_shared, C, C_local)
 
     return main
 
@@ -211,13 +206,13 @@ _tl_matmul_streamk = tl_matmul_streamk(
     "float16",
     "float32",
     2,
-    64,
+    128,
 )
 
 print(_tl_matmul_streamk)
 tl_mod, params = TL.lower(_tl_matmul_streamk)
 tl_mod = TL.Profiler(tl_mod, params, [], TL.TensorSupplyType.Integer)
-print(tl_mod.mod.imported_modules[0].get_source())
+
 b_c = torch.zeros((m, n), device="cuda", dtype=torch.float16)
 
 tl_mod(A, B, b_c)

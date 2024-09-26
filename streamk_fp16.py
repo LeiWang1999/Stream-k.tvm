@@ -113,7 +113,6 @@ print(f"{iters_per_tile=} ")
 sm_patition_factor = max(blocking_tiles // total_sm, 1)
 
 
-
 def tl_matmul_streamk(
     M,
     N,
@@ -152,7 +151,7 @@ def tl_matmul_streamk(
         warp_row_tiles=warp_row_tiles,
         warp_col_tiles=warp_col_tiles,
         chunk=chunk,
-        threads=threads,
+        
     )
 
     import tvm.tl.language as T

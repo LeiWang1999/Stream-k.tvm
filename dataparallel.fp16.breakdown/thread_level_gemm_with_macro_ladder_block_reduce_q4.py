@@ -8,8 +8,14 @@ from bitblas.base.arch import CUDA
 from bitblas.base.roller.rasterization import Rasterization2DColumn
 from bitblas.utils import auto_detect_nvidia_target
 from bitblas.tl.utils import get_swizzle_layout
+from bitblas.quantization import _tir_packed_to_unsigned_convert
 from bitblas.tl.macro_generator import TensorCorePTXMacroGeneratorWithLadderTransform
+from bitblas.gpu.intrin.lop3 import decode_i4_to_f16
 torch.manual_seed(0)
+
+num_bits = 4
+num_elems_per_byte = 8 // num_bits
+storage_dtype = "int8"
 
 VERIFY_CORRECTNESS = True
 in_dtype = "float16"
@@ -25,9 +31,9 @@ intrin_info = bitblas.base.hint.IntrinInfo(
 config = bitblas.base.Hint.from_dict(
     {
         "arch": arch,
-        "block": [128, 128],
-        "warp": [64, 64],
-        "rstep": [32], 
+        "block": [16, 128],
+        "warp": [16, 32],
+        "rstep": [32],
         "pipeline_stage": 2,
         "use_async": False,
         "intrin_info": intrin_info,
@@ -62,8 +68,8 @@ N = 16384
 K = 16384
 if VERIFY_CORRECTNESS:
     M = 256
-    N = 512
-    K = 128
+    N = 1024
+    K = 512
 
 import tvm.tl.language as T
 
@@ -104,9 +110,14 @@ def tl_matmul(
     apply_pad_a = not (is_smooth_a or can_swizzle)
     pad_factor = 8
     A_shape = (M, K)
-    B_shape = (N // micro_size_y, K // micro_size_k, micro_size_y, micro_size_k)
+    B_shape = (N // micro_size_y, K // micro_size_k, micro_size_y, micro_size_k // num_elems_per_byte)
     A_shared_shape = (block_M, (block_K + pad_factor) if apply_pad_a else block_K)
-    B_shared_shape = (block_N // micro_size_y, block_K // micro_size_k, micro_size_y, micro_size_k)
+    B_shared_shape = (
+        block_N // micro_size_y,
+        block_K // micro_size_k,
+        micro_size_y,
+        micro_size_k // num_elems_per_byte,
+    )
     C_shared_shape = (block_M // micro_size_x, block_N // micro_size_y, micro_size_x, micro_size_y)
 
     warp_size = 32
@@ -120,24 +131,30 @@ def tl_matmul(
         a_transposed=False, b_transposed=True, block_row_warps=block_row_warps,
         block_col_warps=block_col_warps, warp_row_tiles=warp_row_tiles,
         warp_col_tiles=warp_col_tiles, chunk=chunk, reduce_k=reduce_k,
-        transform_kind_b=transform_b
+        transform_kind_b=transform_b, num_elems_per_byte=num_elems_per_byte
     )
 
+    vec_load_qb = 16
+    if block_N * (block_K // reduce_k) // num_elems_per_byte // threads < vec_load_qb:
+        vec_load_qb = block_N * (block_K // reduce_k) // num_elems_per_byte // threads
     @T.prim_func
     def main(
         A: T.Buffer(A_shape, dtypeAB),
-        B: T.Buffer(B_shape, dtypeAB),
+        B: T.Buffer(B_shape, storage_dtype),
         C: T.Buffer((M, N), dtypeC),
     ):
         with T.Kernel(
-            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
+            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads, prelude=decode_i4_to_f16
         ) as (bx, by):
 
             A_shared = T.alloc_shared(A_shared_shape, dtypeAB, scope=shared_scope)
-            B_shared = T.alloc_shared(B_shared_shape, dtypeAB, scope=shared_scope)
+            B_shared = T.alloc_shared(
+                B_shared_shape, storage_dtype, scope=shared_scope
+            )
             C_shared = T.alloc_shared(C_shared_shape, dtypeC, scope=shared_scope)
             A_local = T.alloc_fragment((warp_rows * local_size), dtypeAB, scope="local")
-            B_local = T.alloc_fragment((warp_cols * local_size), dtypeAB, scope="local")
+            B_local = T.alloc_fragment((warp_cols * local_size // num_elems_per_byte), storage_dtype, scope="local")
+            B_dequantize_local = T.alloc_fragment((warp_cols * local_size), dtypeAB, scope="local")
             C_local = T.alloc_fragment((warp_rows * warp_cols * local_size), accum_dtype, scope="local")
             reduced_accum_res = T.alloc_fragment(
                 0, accum_dtype, scope="local"
@@ -164,9 +181,22 @@ def tl_matmul(
                     A_shared[i, vk] = A[by * block_M + i, ko * block_K + vk]
 
                 # Load B into shared memory
-                for j, k, jj, kk in T.Parallel(block_N // micro_size_y, (block_K // reduce_k) // micro_size_k, micro_size_y, micro_size_k):
-                    vk = rk * ((block_K // reduce_k) // micro_size_k) + k
-                    B_shared[j, vk, jj, kk] = B[bx * (block_N // micro_size_y) + j, ko * (block_K // micro_size_k) + vk, jj, kk]
+                # for j, k, jj, kk in T.Parallel(
+                #     (block_N // micro_size_y), block_K // micro_size_k, micro_size_y, micro_size_k // num_elems_per_byte
+                # ):
+                #     vk = rk * (block_K // reduce_k // micro_size_k) + k
+                #     B_shared[j, vk, jj, kk] = B[bx * (block_N // micro_size_y) + j, ko * (block_K // micro_size_k) + vk, jj, kk]
+                
+                # TODO(lei): Layout Inference Pass is not efficient to handle the four dims int8 load
+                for i in T.serial(block_N * (block_K // reduce_k) // num_elems_per_byte // (threads * vec_load_qb)):
+                    for v in T.vectorized(0, vec_load_qb):
+                        t = thread_bindings
+                        idx = i * threads * vec_load_qb * reduce_k + rk * threads * vec_load_qb + t * vec_load_qb + v
+                        vkk = idx % (micro_size_k // num_elems_per_byte)
+                        vjj = (idx // (micro_size_k // num_elems_per_byte)) % micro_size_y
+                        vk = (idx // (micro_size_k // num_elems_per_byte) // micro_size_y) % (block_K // micro_size_k)
+                        vj = (idx // (micro_size_k // num_elems_per_byte) // micro_size_y // (block_K // micro_size_k)) % (block_N // micro_size_y)
+                        B_shared[vj, vk, vjj, vkk] = B[bx * (block_N // micro_size_y) + vj, ko * (block_K // micro_size_k) + vk, vjj, vkk]
 
                 for ki in T.serial(0, (block_K // (micro_size_k * reduce_k))):
 
@@ -190,31 +220,37 @@ def tl_matmul(
                         rk=rk,
                     )
 
+                    for j in T.serial(warp_cols):
+                        local_size_b = ptx_macro_generator.local_size_b
+                        T.call_extern('handle', 'decode_i4u_to_f16', T.address_of(B_local[j * local_size_b // num_elems_per_byte]), 
+                                           T.address_of(B_dequantize_local[j * local_size_b]), 8)
+
                     ptx_macro_generator.MMA(
                         ptx_macro_generator,
                         A_local,
-                        B_local,
+                        B_dequantize_local,
                         C_local
                     )
 
-            for n in T.serial(warp_rows * warp_cols * local_size):
-                T.attr(
-                    T.comm_reducer(lambda x, y: x + y, [T.float16(0)]),
-                    "reduce_scope",
-                    T.reinterpret(T.uint64(0), dtype="handle"),
-                )
-                T.evaluate(
-                    T.tvm_thread_allreduce(
-                        T.uint32(1),
-                        C_local[n],
-                        True,
-                        reduced_accum_res[0],
-                        rk,
-                        dtype="handle",
+            if reduce_k > 1:
+                for n in T.serial(warp_rows * warp_cols * local_size):
+                    T.attr(
+                        T.comm_reducer(lambda x, y: x + y, [T.float16(0)]),
+                        "reduce_scope",
+                        T.reinterpret(T.uint64(0), dtype="handle"),
                     )
-                )
-                if rk == 0:
-                    C_local[n] = reduced_accum_res[0]
+                    T.evaluate(
+                        T.tvm_thread_allreduce(
+                            T.uint32(1),
+                            C_local[n],
+                            True,
+                            reduced_accum_res[0],
+                            rk,
+                            dtype="handle",
+                        )
+                    )
+                    if rk == 0:
+                        C_local[n] = reduced_accum_res[0]
 
             if rk == 0:
                 ptx_macro_generator.STMATRIX(
@@ -224,8 +260,9 @@ def tl_matmul(
                     thread_bindings=thread_bindings,
                 )
 
-                for i, j in T.Parallel(block_M, block_N):
-                    C[by * block_M + i, bx * block_N + j] = C_shared[i // micro_size_x, j // micro_size_y, i % micro_size_x, j % micro_size_y]
+            for i, j in T.Parallel(block_M, (block_N // reduce_k)):
+                vj = rk * (block_N // reduce_k) + j
+                C[by * block_M + i, bx * block_N + vj] = C_shared[i // micro_size_x, vj // micro_size_y, i % micro_size_x, vj % micro_size_y]
 
     return main
 
@@ -244,33 +281,54 @@ mod, params = TL.lower(matmul)
 print(mod.imported_modules[0].get_source())
 mod = TL.Profiler(mod, params, [], TL.TensorSupplyType.Integer)
 
+
+latency = mod.do_bench(mod.func, warmup = 25)
+print(f"Latency: {latency}")
+
+if not VERIFY_CORRECTNESS:
+    exit()
+
 ladder_permutate_config = bitblas.ops.LadderPermutateConfig(
     M=N,
     N=K,
     transform_kind=transform_b,
     transpose_matrix=True,
+    dequantize_bits=num_bits,
+    storage_dtype=storage_dtype,
 )
 
 ladder_permutate = bitblas.ops.LadderPermutate(
     ladder_permutate_config
 )
 
+lop3_permutate_config = bitblas.ops.LOP3PermutateConfig(
+    M=N,
+    N=K,
+    datatype=in_dtype,
+    dequantize_bits=num_bits,
+    storage_dtype=storage_dtype,
+)
+lop3_permutate = bitblas.ops.LOP3Permutate(
+    config=lop3_permutate_config,
+    target=tvm.target.Target("llvm"),
+)
+
 A = torch.rand(M, K, device="cuda", dtype=getattr(torch, in_dtype))
-B = torch.rand(N, K, device="cuda", dtype=getattr(torch, in_dtype))
+qB = torch.randint(0, 127, (N, K // num_elems_per_byte), device="cuda", dtype=getattr(torch, storage_dtype))
 C = torch.zeros(M, N, device="cuda", dtype=getattr(torch, accum_dtype))
 
-LB = ladder_permutate(B.cpu()).cuda()
+B = (
+    torch.zeros(qB.shape[0], qB.shape[1] * 8 // 4,
+                dtype=torch.half).to(torch.half).to(A.device))
+for i in range(B.shape[0]):
+    for j in range(B.shape[1]):
+        B[i][j] = ((qB[i][j // 2] >> (4 * (j % 2))) & 0xF).to(torch.half)
 
-mod(A, LB, C)
+QLB = ladder_permutate(qB.cpu()).cuda()
+QLB = lop3_permutate(QLB.cpu()).cuda()
 
-latency = mod.do_bench(mod.func, warmup = 25)
-print(f"Latency: {latency}")
-
-
-if not VERIFY_CORRECTNESS:
-    exit()
-
-print(C)
 ref_c = torch.matmul(A, B.T).to(getattr(torch, accum_dtype))
 print(ref_c)
+mod(A, QLB, C)
+print(C)
 torch.testing.assert_close(C, ref_c, rtol=1e-2, atol=1e-2)

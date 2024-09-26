@@ -19,7 +19,7 @@ def cdiv(a, b):
 
 torch.manual_seed(0)
 
-VERIFY_CORRECTNESS = False
+VERIFY_CORRECTNESS = True
 in_dtype = "float16"
 accum_dtype = "float16"
 # accum_dtype = "float16"
@@ -33,16 +33,16 @@ intrin_info = bitblas.base.hint.IntrinInfo(
 config = bitblas.base.Hint.from_dict(
     {
         "arch": arch,
-        "block": [16, 32],
-        "warp": [16, 32],
-        "rstep": [128],
-        "pipeline_stage": 1,
+        "block": [16, 128],
+        "warp": [16, 64],
+        "rstep": [32],
+        "pipeline_stage": 2,
         "use_async": False,
         "intrin_info": intrin_info,
         "shared_scope": "shared.dyn",
         "vectorize": {"b": 8, "a": 8},
         "rasterization_plan": Rasterization2DColumn(10),
-        "block_reduction_depth": 2,
+        "block_reduction_depth": 4,
     }
 )
 
@@ -55,8 +55,8 @@ block_row_warps = config.block[0] // warp_row_tiles
 block_col_warps = config.block[1] // warp_col_tiles
 stage = config.pipeline_stage
 use_async = config.use_async
-chunk = config.rstep[0]
 reduce_k = config.block_reduction_depth
+chunk = config.rstep[0] // reduce_k
 
 # tensor core intrinsic size
 shared_scope = config.shared_scope
@@ -188,6 +188,7 @@ def tl_matmul_streamk(
         reduce_k=reduce_k,
         transform_kind_b=transform_b,
     )
+
 
     import tvm.tl.language as T
 

@@ -11,7 +11,7 @@ from bitblas.tl.utils import get_swizzle_layout
 from bitblas.tl.macro_generator import TensorCorePTXMacroGeneratorWithLadderTransform
 torch.manual_seed(0)
 
-VERIFY_CORRECTNESS = True
+VERIFY_CORRECTNESS = False
 in_dtype = "float16"
 accum_dtype = "float16"
 # accum_dtype = "float16"

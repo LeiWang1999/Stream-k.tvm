@@ -5,8 +5,7 @@ import bitblas
 from bitblas import tvm as tvm
 from tvm import tl as TL
 from bitblas.base.arch import CUDA
-from bitblas.base.roller.rasterization import Rasterization2DColumn
-from bitblas.utils import auto_detect_nvidia_target
+from tvm import DataType
 from bitblas.tl.utils import get_swizzle_layout
 from bitblas.tl.macro_generator import TensorCorePTXMacroGenerator
 
@@ -53,9 +52,17 @@ def get_configs():
     ]
     return configs
 
-def make_swizzle_layout(shared_buf):
+
+def make_swizzle_layout(shared_buf, is_smooth=False):
     dtype = shared_buf.dtype
     shape = shared_buf.shape
+    if is_smooth:
+        return T.Layout(shape, lambda *args: args)
+
+    can_swizzle = shape[-1] * DataType(dtype).bits == 512
+    if not can_swizzle:
+        print(f"shape is not swizzlable: {shape} {dtype}")
+        return T.Layout(shape, lambda *args: args)
 
     def transform_func(i, j):
         new_warp_i, new_warp_j = get_swizzle_layout(i, j, shape[-1], dtype)
@@ -117,8 +124,6 @@ def tl_matmul_streamk(
         streamk_full_tiles = streamk_iters // streamk_programs
         streamk_partial_tiles = streamk_iters % streamk_programs
 
-        print(f"{total_tiles=} ")
-        print(f"{iters_per_tile=} ")
 
         sm_patition_factor = max(blocking_tiles // total_sm, 1)
 
@@ -341,12 +346,12 @@ def tl_matmul_streamk(
                 start_iter = T.alloc_fragment((1,), "int32", "local")
                 end_iter = T.alloc_fragment((1,), "int32", "local")
 
-                # T.annotate_layout(
-                #     {
-                #         A_shared: make_swizzle_layout(A_shared),
-                #         B_shared: make_swizzle_layout(B_shared),
-                #     }
-                # )
+                T.annotate_layout(
+                    {
+                        A_shared: make_swizzle_layout(A_shared),
+                        B_shared: make_swizzle_layout(B_shared),
+                    }
+                )
                 T.use_swizzle(10)
                 thread_bindings = T.thread_binding(0, threads, "threadIdx.x")
 

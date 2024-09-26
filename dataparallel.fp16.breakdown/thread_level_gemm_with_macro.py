@@ -28,7 +28,7 @@ config = bitblas.base.Hint.from_dict(
         "block": [16, 64],
         "warp": [16, 16],
         "rstep": [32],
-        "pipeline_stage": 2,
+        "pipeline_stage": 1,
         "use_async": False,
         "intrin_info": intrin_info,
         "shared_scope": "shared.dyn",
@@ -58,7 +58,7 @@ K = 16384
 if VERIFY_CORRECTNESS:
     M = 256
     N = 512
-    K = 32
+    K = 128
 
 A = torch.rand(M, K, device="cuda", dtype=getattr(torch, in_dtype))
 B = torch.rand(N, K, device="cuda", dtype=getattr(torch, in_dtype))
@@ -140,7 +140,8 @@ def tl_matmul(
 
             T.clear(C_local)
 
-            for ko in T.Pipelined((K // block_K), num_stages=stage):
+            # for ko in T.Pipelined((K // block_K), num_stages=stage):
+            for ko in T.serial((K // block_K)):
 
                 # Load A into shared memory
                 for i, k in T.Parallel(block_M, block_K):
