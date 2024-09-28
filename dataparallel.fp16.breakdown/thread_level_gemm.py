@@ -123,8 +123,6 @@ def tl_matmul(
             T.clear(C_local)
 
             for ko in T.Pipelined((K // block_K), num_stages=(stage - 1)):
-                # TODO(lei): storage sync should be able to be injected automatically by TVM Pass
-                T.tvm_storage_sync("shared")
 
                 # Load A into shared memory
                 for i, k in T.Parallel(block_M, block_K):
@@ -133,9 +131,6 @@ def tl_matmul(
                 # Load B into shared memory
                 for j, k in T.Parallel(block_N, block_K):
                     B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
-
-                # TODO(lei): storage sync should be able to be injected automatically by TVM Pass
-                T.tvm_storage_sync("shared")
 
                 for ki in T.serial(0, (block_K // micro_size_k)):
                     # Load A into fragment
